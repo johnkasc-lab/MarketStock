@@ -336,33 +336,41 @@ def run_full_scan():
     print(f"[{ist_str()}] Scan done — BUY:{len(buys)} SELL:{len(sells)}")
     print("-" * 60)
 
-# ── Scheduler loop ─────────────────────────────────────────
+# ── Entry point ─────────────────────────────────────────────
+import sys
+
+SINGLE_RUN = "--single-run" in sys.argv
+
+executor = Executor()
 print("=" * 60)
-print("INTRADAY SCANNER — STANDALONE BACKGROUND SERVICE")
-print(f"Scans every {SCAN_INTERVAL} minutes during market hours (9:15 AM - 3:15 PM IST)")
+print("INTRADAY SCANNER")
+print(f"Mode: {'SINGLE RUN (GitHub Actions)' if SINGLE_RUN else 'CONTINUOUS LOOP (local)'}")
+print(f"Execution: {'LIVE (real orders via Kite)' if os.getenv('LIVE_TRADING','false').lower()=='true' else 'PAPER (simulated, no real orders)'}")
 print(f"Started at: {ist_str()}")
 print("=" * 60)
 
-executor = Executor()
-print(f"Execution mode: {'LIVE (real orders via Kite)' if os.getenv('LIVE_TRADING','false').lower()=='true' else 'PAPER (simulated, no real orders)'}")
+if SINGLE_RUN:
+    # GitHub Actions calls this script every 5 minutes itself —
+    # so we do ONE scan + ONE position check, then exit cleanly.
+    run_full_scan()
+    executor.monitor_positions()
+    executor.eod_square_off_if_needed()
+    print(f"[{ist_str()}] Single run complete — exiting.")
 
-send_telegram(
-    f"🚀 <b>Scheduler Started</b>\n"
-    f"Will scan every {SCAN_INTERVAL} min during market hours.\n"
-    f"Time: {ist_str()}"
-)
+else:
+    # Local laptop mode — keep looping forever, like before.
+    send_telegram(
+        f"🚀 <b>Scheduler Started</b>\n"
+        f"Will scan every {SCAN_INTERVAL} min during market hours.\n"
+        f"Time: {ist_str()}"
+    )
 
-# Run once immediately on startup if market is open
-run_full_scan()
+    run_full_scan()
 
-# Then schedule every N minutes
-schedule.every(SCAN_INTERVAL).minutes.do(run_full_scan)
+    schedule.every(SCAN_INTERVAL).minutes.do(run_full_scan)
+    schedule.every(POSITION_CHECK_INTERVAL).minutes.do(executor.monitor_positions)
+    schedule.every(1).minutes.do(executor.eod_square_off_if_needed)
 
-# NEW: separately schedule position monitoring (SL/target checks) more
-# frequently than the scan itself, plus EOD square-off check
-schedule.every(POSITION_CHECK_INTERVAL).minutes.do(executor.monitor_positions)
-schedule.every(1).minutes.do(executor.eod_square_off_if_needed)
-
-while True:
-    schedule.run_pending()
-    time.sleep(20)
+    while True:
+        schedule.run_pending()
+        time.sleep(20)
