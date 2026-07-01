@@ -1,13 +1,16 @@
 """
-Standalone Intraday Scanner Scheduler
-Run this in its own terminal window — separate from Streamlit.
-This keeps running and scanning every 5 minutes, sending Telegram
-alerts, completely independent of whether your browser is open.
+Standalone Intraday Scanner Scheduler — Multi-User Edition
+Scans NSE stocks, generates signals, and routes Telegram alerts
+to EACH active user based on their own watchlist + trial/subscription
+status (from users.csv). Your own paper/live execution (executor.py)
+still runs on your personal capital only — separate from customer alerts.
 
 Usage:
-    python scheduler.py
+    python scheduler.py                 # continuous loop (local laptop)
+    python scheduler.py --single-run    # one scan + exit (GitHub Actions)
 """
 
+import sys
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -18,17 +21,16 @@ import os
 
 from dotenv import load_dotenv
 load_dotenv()
-from executor import Executor   # ← NEW: risk-managed execution layer
+from executor import Executor
 
 # ── Config ─────────────────────────────────────────────────
-# Secrets now come from environment variables — never hardcode tokens.
-# Before running:  export TELEGRAM_TOKEN=...  export TELEGRAM_CHAT_ID=...
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 LOG_FILE         = "intraday_trades.csv"
 ALERTED_FILE     = "alerted_today.csv"
-SCAN_INTERVAL    = 5   # minutes
-POSITION_CHECK_INTERVAL = 1   # minutes — how often open positions are checked for SL/target
+USERS_FILE       = "users.csv"
+SCAN_INTERVAL    = 5
+POSITION_CHECK_INTERVAL = 1
 
 # ── Sectors ────────────────────────────────────────────────
 SECTORS = {
@@ -111,17 +113,17 @@ def is_market_open():
         (n.hour == 15 and n.minute <= 15)
     )
 
-# ── Telegram ───────────────────────────────────────────────
-def send_telegram(msg):
+# ── Telegram (admin/founder only) ─────────────────────────
+def send_telegram(msg, chat_id=None):
+    cid = chat_id or TELEGRAM_CHAT_ID
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID,
-                  "text": msg, "parse_mode": "HTML"},
+            data={"chat_id": cid, "text": msg, "parse_mode": "HTML"},
             timeout=10
         )
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram error (chat_id={cid}): {e}")
 
 # ── Fetch 5-min intraday data ──────────────────────────────
 def fetch_intraday(ticker):
@@ -249,6 +251,38 @@ def mark_alerted(ticker, strategy):
         updated = row
     updated.to_csv(ALERTED_FILE, index=False)
 
+# ── Multi-user routing ──────────────────────────────────────
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        return pd.DataFrame()
+    return pd.read_csv(USERS_FILE)
+
+def normalize_ticker(t):
+    return str(t).strip().upper().replace(".NS", "")
+
+def is_user_active(user_row):
+    status = str(user_row["subscription_status"]).lower()
+    if status == "active":
+        return True
+    if status == "trial":
+        trial_end = pd.to_datetime(user_row["trial_end_date"]).date()
+        return ist_now().date() <= trial_end
+    return False
+
+def is_stock_in_watchlist(ticker, watchlist_str):
+    watchlist_str = str(watchlist_str).strip()
+    if watchlist_str.upper() == "DEFAULT":
+        return True
+    custom_list = [normalize_ticker(t) for t in watchlist_str.split(",")]
+    return normalize_ticker(ticker) in custom_list
+
+def get_recipients_for_signal(ticker, users_df):
+    recipients = []
+    for _, user in users_df.iterrows():
+        if is_user_active(user) and is_stock_in_watchlist(ticker, user["watchlist"]):
+            recipients.append(str(user["telegram_chat_id"]))
+    return recipients
+
 # ── Scan one stock ─────────────────────────────────────────
 def scan_stock(ticker):
     data = fetch_intraday(ticker)
@@ -266,11 +300,11 @@ def scan_stock(ticker):
                     "Stock"    : ticker.replace(".NS", ""),
                     "Strategy" : strat,
                     "Signal"   : sig,
-                    "Price"    : f"₹{price}",
-                    "Stop Loss": f"₹{sl}" if sl else "—",
-                    "Target"   : f"₹{target}" if target else "—",
-                    "R:R"      : f"1:{rr}" if rr else "—",
-                    "RSI"      : round(rsi, 1) if rsi else "—",
+                    "Price"    : f"Rs.{price}",
+                    "Stop Loss": f"Rs.{sl}" if sl else "-",
+                    "Target"   : f"Rs.{target}" if target else "-",
+                    "R:R"      : f"1:{rr}" if rr else "-",
+                    "RSI"      : round(rsi, 1) if rsi else "-",
                 })
         except: pass
     return signals
@@ -284,23 +318,10 @@ def save_to_log(signals):
     new_log = pd.concat([log, pd.DataFrame(signals)], ignore_index=True)
     new_log.to_csv(LOG_FILE, index=False)
 
-def alert_signal(s):
-    emoji = "🟢" if s["Signal"] == "BUY" else "🔴"
-    send_telegram(
-        f"{emoji} <b>{s['Signal']} — {s['Stock']}</b>\n"
-        f"Strategy   : {s['Strategy']}\n"
-        f"Price      : {s['Price']}\n"
-        f"Stop Loss  : {s['Stop Loss']}\n"
-        f"Target     : {s['Target']}\n"
-        f"Risk:Reward: {s['R:R']}\n"
-        f"RSI        : {s['RSI']}\n"
-        f"Time       : {s['Time']}"
-    )
-
 # ── Main scan job ──────────────────────────────────────────
 def run_full_scan():
     if not is_market_open():
-        print(f"[{ist_str()}] Market closed — skipping scan.")
+        print(f"[{ist_str()}] Market closed - skipping scan.")
         return
 
     print(f"[{ist_str()}] Starting scan of {len(ALL_STOCKS)} stocks...")
@@ -316,61 +337,70 @@ def run_full_scan():
     buys  = [s for s in all_signals if s["Signal"] == "BUY"]
     sells = [s for s in all_signals if s["Signal"] == "SELL"]
 
-    for s in buys + sells:
-        alert_signal(s)
+    # Route each signal to the right users
+    users_df = load_users()
+    if users_df.empty:
+        print("   WARNING: users.csv not found or empty - no customer alerts will be sent.")
+    else:
+        active_users = sum(1 for _, u in users_df.iterrows() if is_user_active(u))
+        print(f"   Users loaded: {len(users_df)} total, {active_users} active")
+        for s in buys + sells:
+            chat_ids = get_recipients_for_signal(s["Stock"], users_df)
+            for chat_id in chat_ids:
+                send_telegram(
+                    f"{'BUY' if s['Signal']=='BUY' else 'SELL'} - {s['Stock']}\n"
+                    f"Strategy   : {s['Strategy']}\n"
+                    f"Price      : {s['Price']}\n"
+                    f"Stop Loss  : {s['Stop Loss']}\n"
+                    f"Target     : {s['Target']}\n"
+                    f"Risk:Reward: {s['R:R']}\n"
+                    f"RSI        : {s['RSI']}\n"
+                    f"Time       : {s['Time']}",
+                    chat_id=chat_id
+                )
+            print(f"   {s['Signal']} {s['Stock']} -> sent to {len(chat_ids)} user(s)")
 
     save_to_log(all_signals)
-
-    # ── NEW: hand signals to the risk-managed executor ──────
-    # Paper-trades by default; set LIVE_TRADING=true env var to go live.
     executor.process_signals(all_signals)
 
-    if buys or sells:
-        send_telegram(
-            f"✅ <b>Scan Complete</b>\n"
-            f"🟢 BUY  : {len(buys)}\n"
-            f"🔴 SELL : {len(sells)}\n"
-            f"{ist_str()}"
-        )
+    # Founder summary - goes to YOUR admin chat only
+    send_telegram(
+        f"Scan Complete\n"
+        f"BUY  : {len(buys)}\n"
+        f"SELL : {len(sells)}\n"
+        f"Users: {len(users_df) if not users_df.empty else 0}\n"
+        f"{ist_str()}"
+    )
 
-    print(f"[{ist_str()}] Scan done — BUY:{len(buys)} SELL:{len(sells)}")
+    print(f"[{ist_str()}] Scan done - BUY:{len(buys)} SELL:{len(sells)}")
     print("-" * 60)
 
 # ── Entry point ─────────────────────────────────────────────
-import sys
-
 SINGLE_RUN = "--single-run" in sys.argv
 
 executor = Executor()
 print("=" * 60)
-print("INTRADAY SCANNER")
+print("INTRADAY SCANNER - MULTI-USER EDITION")
 print(f"Mode: {'SINGLE RUN (GitHub Actions)' if SINGLE_RUN else 'CONTINUOUS LOOP (local)'}")
-print(f"Execution: {'LIVE (real orders via Kite)' if os.getenv('LIVE_TRADING','false').lower()=='true' else 'PAPER (simulated, no real orders)'}")
+print(f"Capital mode: {'LIVE' if os.getenv('LIVE_TRADING','false').lower()=='true' else 'PAPER'}")
 print(f"Started at: {ist_str()}")
 print("=" * 60)
 
 if SINGLE_RUN:
-    # GitHub Actions calls this script every 5 minutes itself —
-    # so we do ONE scan + ONE position check, then exit cleanly.
     run_full_scan()
     executor.monitor_positions()
     executor.eod_square_off_if_needed()
-    print(f"[{ist_str()}] Single run complete — exiting.")
-
+    print(f"[{ist_str()}] Single run complete - exiting.")
 else:
-    # Local laptop mode — keep looping forever, like before.
     send_telegram(
-        f"🚀 <b>Scheduler Started</b>\n"
-        f"Will scan every {SCAN_INTERVAL} min during market hours.\n"
+        f"Scheduler Started\n"
+        f"Scanning every {SCAN_INTERVAL} min during market hours.\n"
         f"Time: {ist_str()}"
     )
-
     run_full_scan()
-
     schedule.every(SCAN_INTERVAL).minutes.do(run_full_scan)
     schedule.every(POSITION_CHECK_INTERVAL).minutes.do(executor.monitor_positions)
     schedule.every(1).minutes.do(executor.eod_square_off_if_needed)
-
     while True:
         schedule.run_pending()
         time.sleep(20)
