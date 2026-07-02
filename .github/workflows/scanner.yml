@@ -55,7 +55,7 @@ jobs:
           LIVE_TRADING: ${{ secrets.LIVE_TRADING }}
           TRADING_CAPITAL: ${{ secrets.TRADING_CAPITAL }}
         run: |
-          python scheduler_project1.py --single-run
+          python scheduler.py --single-run
 
       - name: Commit updated CSV files back to repo
         run: |
