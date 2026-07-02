@@ -1,13 +1,10 @@
 """
-PROJECT 1 — Intraday Scanner (Single User / Your Own Alerts)
-Scans NSE stocks every 5 min during market hours via GitHub Actions.
-Sends BUY/SELL signals to YOUR Telegram only.
-Includes: sector rotation (fast runs), Yahoo Finance fix,
-          Nifty trend filter, ORB strategy, paper position tracking.
-
-Usage:
-    python scheduler.py                 # continuous loop (local laptop)
-    python scheduler.py --single-run    # one scan + exit (GitHub Actions)
+FILE NAME: scheduler_GITHUB.py
+PURPOSE  : Runs on GitHub Actions via --single-run flag.
+           One scan per run, sector rotation, commits CSVs back to repo.
+USAGE    : python scheduler_GITHUB.py --single-run
+WHERE    : Upload this to your GitHub repo as scheduler.py
+           (GitHub Actions calls it as: python scheduler.py --single-run)
 """
 
 import sys
@@ -19,7 +16,7 @@ import schedule
 import time
 import os
 
-# ── Config ─────────────────────────────────────────────────
+# ── Config — reads from GitHub Secrets (env vars) ──────────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 LOG_FILE         = "intraday_trades.csv"
@@ -114,7 +111,6 @@ def is_market_open():
     )
 
 def is_good_trading_window():
-    """Avoid first 15 min and last 15 min of session."""
     n = ist_now()
     after_open   = not (n.hour == 9 and n.minute < 30)
     before_close = not (n.hour >= 15)
@@ -125,19 +121,34 @@ def is_eod():
     return n.weekday() < 5 and n.hour == 15 and n.minute >= 15
 
 def get_current_sector():
-    """Rotate sectors every 15 min so each run is fast (<2 min)."""
+    """One sector per run — rotates every 15 minutes."""
     n = ist_now()
-    minutes_since_open = (n.hour - 9) * 60 + n.minute - 15
-    if minutes_since_open < 0:
-        minutes_since_open = 0
+    minutes_since_open = max(0, (n.hour - 9) * 60 + n.minute - 15)
     idx = (minutes_since_open // 15) % len(SECTOR_NAMES)
     return SECTOR_NAMES[idx]
+
+# ── CSV reset: clear alerted_today.csv at start of each new day ──
+def reset_alert_file_if_new_day():
+    today = ist_now().strftime("%Y-%m-%d")
+    if os.path.exists(ALERTED_FILE):
+        df = pd.read_csv(ALERTED_FILE)
+        if "Date" in df.columns and len(df) > 0:
+            if df["Date"].iloc[0] != today:
+                print(f"New day detected ({today}) — resetting {ALERTED_FILE}")
+                pd.DataFrame(columns=["Date","Ticker","Strategy"]).to_csv(ALERTED_FILE, index=False)
+            else:
+                print(f"Same day ({today}) — keeping {ALERTED_FILE} ({len(df)} entries)")
+        else:
+            pd.DataFrame(columns=["Date","Ticker","Strategy"]).to_csv(ALERTED_FILE, index=False)
+    else:
+        pd.DataFrame(columns=["Date","Ticker","Strategy"]).to_csv(ALERTED_FILE, index=False)
+        print(f"Created fresh {ALERTED_FILE}")
 
 # ── Telegram ───────────────────────────────────────────────
 def send_telegram(msg, chat_id=None):
     cid = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_TOKEN or not cid:
-        print("   [Telegram] Token/ChatID missing.")
+        print("   [Telegram] Token/ChatID missing — check GitHub Secrets.")
         return
     try:
         r = requests.post(
@@ -150,7 +161,7 @@ def send_telegram(msg, chat_id=None):
     except Exception as e:
         print(f"   [Telegram] Error: {e}")
 
-# ── Yahoo Finance with User-Agent fix + retries ────────────
+# ── Yahoo Finance session (fixes GitHub Actions IP blocks) ─
 def _yf_session():
     s = requests.Session()
     s.headers.update({
@@ -194,7 +205,6 @@ def calc_vwap(data):
     vol = data["Volume"].squeeze()
     return (tp * vol).cumsum() / vol.cumsum()
 
-# ── Nifty trend filter ─────────────────────────────────────
 def get_nifty_trend():
     session = _yf_session()
     try:
@@ -211,10 +221,10 @@ def get_nifty_trend():
         if change_pct < -0.3: return "DOWN"
         return "NEUTRAL"
     except Exception as e:
-        print(f"   Nifty error: {e} - defaulting NEUTRAL")
+        print(f"   Nifty error: {e} — defaulting NEUTRAL")
         return "NEUTRAL"
 
-# ── Strategy 1: SCALP ──────────────────────────────────────
+# ── Strategies ─────────────────────────────────────────────
 def scalp_signal(data):
     close  = data["Close"].squeeze()
     volume = data["Volume"].squeeze()
@@ -235,7 +245,6 @@ def scalp_signal(data):
         return "SELL", price, round(price*1.003,2), round(price*0.995,2), rsi_val, "SCALP"
     return "HOLD", price, 0, 0, rsi_val, "SCALP"
 
-# ── Strategy 2: MOMENTUM ───────────────────────────────────
 def momentum_signal(data):
     close  = data["Close"].squeeze()
     volume = data["Volume"].squeeze()
@@ -256,7 +265,6 @@ def momentum_signal(data):
         return "SELL", price, round(e21n*1.007,2), round(price*0.985,2), rsi_val, "MOMENTUM"
     return "HOLD", price, 0, 0, rsi_val, "MOMENTUM"
 
-# ── Strategy 3: SWING ──────────────────────────────────────
 def swing_signal(data):
     close = data["Close"].squeeze()
     ema12  = close.ewm(span=12, adjust=False).mean()
@@ -279,7 +287,6 @@ def swing_signal(data):
         return "SELL", price, round(bbu*1.01,2), round(sma*0.975,2), 0, "SWING"
     return "HOLD", price, 0, 0, 0, "SWING"
 
-# ── Strategy 4: ORB (Opening Range Breakout) ───────────────
 def orb_signal(data):
     try:
         close  = data["Close"].squeeze()
@@ -300,9 +307,9 @@ def orb_signal(data):
         if not in_window:
             return "HOLD", price, 0, 0, 0, "ORB"
         if price > orb_high and vol_ok:
-            return "BUY",  price, round(orb_high - orb_range*0.5,2), round(price + orb_range*1.5,2), 0, "ORB"
+            return "BUY",  price, round(orb_high-orb_range*0.5,2), round(price+orb_range*1.5,2), 0, "ORB"
         if price < orb_low and vol_ok:
-            return "SELL", price, round(orb_low  + orb_range*0.5,2), round(price - orb_range*1.5,2), 0, "ORB"
+            return "SELL", price, round(orb_low+orb_range*0.5,2), round(price-orb_range*1.5,2), 0, "ORB"
         return "HOLD", price, 0, 0, 0, "ORB"
     except:
         return "HOLD", 0, 0, 0, 0, "ORB"
@@ -313,6 +320,8 @@ def already_alerted_today(ticker, strategy):
     if not os.path.exists(ALERTED_FILE):
         return False
     df = pd.read_csv(ALERTED_FILE)
+    if df.empty:
+        return False
     return len(df[(df["Date"] == today) &
                   (df["Ticker"] == ticker) &
                   (df["Strategy"] == strategy)]) > 0
@@ -321,7 +330,8 @@ def mark_alerted(ticker, strategy):
     today = ist_now().strftime("%Y-%m-%d")
     row   = pd.DataFrame([{"Date": today, "Ticker": ticker, "Strategy": strategy}])
     if os.path.exists(ALERTED_FILE):
-        updated = pd.concat([pd.read_csv(ALERTED_FILE), row], ignore_index=True)
+        existing = pd.read_csv(ALERTED_FILE)
+        updated  = pd.concat([existing, row], ignore_index=True)
     else:
         updated = row
     updated.to_csv(ALERTED_FILE, index=False)
@@ -358,8 +368,10 @@ def open_paper_position(signal):
     if len(pos_df[pos_df["Status"] == "OPEN"]) >= 5:
         return
     price  = float(str(signal["Price"]).replace("Rs.","").replace("₹",""))
-    sl     = float(str(signal["Stop Loss"]).replace("Rs.","").replace("₹","").replace("-","0") or 0)
-    target = float(str(signal["Target"]).replace("Rs.","").replace("₹","").replace("-","0") or 0)
+    sl_raw = str(signal["Stop Loss"]).replace("Rs.","").replace("₹","")
+    sl     = float(sl_raw) if sl_raw not in ["-","0",""] else 0
+    tg_raw = str(signal["Target"]).replace("Rs.","").replace("₹","")
+    target = float(tg_raw) if tg_raw not in ["-","0",""] else 0
     risk   = abs(price - sl) if sl else price * 0.01
     qty    = max(1, int((CAPITAL * RISK_PCT) / risk)) if risk > 0 else 1
     new_row = pd.DataFrame([{
@@ -390,8 +402,8 @@ def monitor_and_close_positions():
         if ltp is None:
             continue
         entry  = float(pos["EntryPrice"])
-        sl     = float(pos["SL"])     if pos["SL"]     else 0
-        target = float(pos["Target"]) if pos["Target"] else 0
+        sl     = float(pos["SL"])     if pd.notna(pos["SL"])     and pos["SL"] != 0 else 0
+        target = float(pos["Target"]) if pd.notna(pos["Target"]) and pos["Target"] != 0 else 0
         side   = pos["Side"]
         qty    = int(pos["Qty"])
         exit_reason = None
@@ -402,15 +414,15 @@ def monitor_and_close_positions():
             if side == "BUY"  and ltp >= target: exit_reason = "TARGET_HIT"
             if side == "SELL" and ltp <= target: exit_reason = "TARGET_HIT"
         if exit_reason:
-            pnl = round((ltp - entry)*qty, 2) if side == "BUY" else round((entry - ltp)*qty, 2)
+            pnl = round((ltp-entry)*qty,2) if side=="BUY" else round((entry-ltp)*qty,2)
             pos_df.at[idx, "Status"] = "CLOSED"
             new_ledger_rows.append({
                 "Date"      : pos["Date"],       "Ticker"    : pos["Ticker"],
                 "Strategy"  : pos["Strategy"],   "Side"      : side,
-                "EntryPrice": entry,              "ExitPrice" : ltp,
-                "Qty"       : qty,                "PnL"       : pnl,
-                "ExitReason": exit_reason,        "EntryTime" : pos["EntryTime"],
-                "ExitTime"  : ist_str(),          "Mode"      : "LIVE" if LIVE_TRADING else "PAPER",
+                "EntryPrice": entry,             "ExitPrice" : ltp,
+                "Qty"       : qty,               "PnL"       : pnl,
+                "ExitReason": exit_reason,       "EntryTime" : pos["EntryTime"],
+                "ExitTime"  : ist_str(),         "Mode"      : "LIVE" if LIVE_TRADING else "PAPER",
             })
             emoji = "✅" if exit_reason == "TARGET_HIT" else "🛑"
             send_telegram(
@@ -430,6 +442,7 @@ def eod_square_off():
     ledger = load_ledger()
     open_p = pos_df[pos_df["Status"] == "OPEN"].copy()
     if open_p.empty:
+        print("   [EOD] No open positions to close.")
         return
     new_ledger_rows = []
     for idx, pos in open_p.iterrows():
@@ -455,12 +468,12 @@ def eod_square_off():
     send_telegram(
         f"📊 <b>EOD Summary</b>\n"
         f"Positions closed : {len(new_ledger_rows)}\n"
-        f"Total P&amp;L    : Rs.{round(total_pnl,2)}\n"
+        f"Total P&L        : Rs.{round(total_pnl,2)}\n"
         f"Mode             : {'LIVE' if LIVE_TRADING else 'PAPER'}\n"
         f"Time             : {ist_str()}"
     )
 
-# ── Scan one stock (all 4 strategies) ─────────────────────
+# ── Scan one stock ─────────────────────────────────────────
 def scan_stock(ticker, nifty_trend="NEUTRAL"):
     data = fetch_intraday(ticker)
     if data is None:
@@ -471,7 +484,7 @@ def scan_stock(ticker, nifty_trend="NEUTRAL"):
             sig, price, sl, target, rsi, strat = strategy_fn(data)
             if nifty_trend == "DOWN" and sig == "BUY":  continue
             if nifty_trend == "UP"   and sig == "SELL": continue
-            if sig in ["BUY", "SELL"] and not already_alerted_today(ticker, strat):
+            if sig in ["BUY","SELL"] and not already_alerted_today(ticker, strat):
                 mark_alerted(ticker, strat)
                 rr = round(abs(target-price)/abs(price-sl),2) if sl and target and price!=sl else 0
                 signals.append({
@@ -499,24 +512,20 @@ def save_to_log(signals):
 # ── Main scan ──────────────────────────────────────────────
 def run_full_scan():
     if not is_market_open():
-        print(f"[{ist_str()}] Market closed - skipping.")
+        print(f"[{ist_str()}] Market closed — skipping.")
         return
 
-    # EOD square-off
     if is_eod():
-        print(f"[{ist_str()}] EOD - squaring off positions.")
+        print(f"[{ist_str()}] EOD — squaring off positions.")
         eod_square_off()
         return
 
-    # Monitor open positions first
     monitor_and_close_positions()
 
-    # Skip signal scanning outside good window (first/last 15 min)
     if not is_good_trading_window():
-        print(f"[{ist_str()}] Outside signal window - monitoring only.")
+        print(f"[{ist_str()}] Outside signal window — monitoring only.")
         return
 
-    # Sector rotation — scan one sector per run
     current_sector = get_current_sector()
     sector_stocks  = SECTORS[current_sector]
     nifty_trend    = get_nifty_trend()
@@ -524,7 +533,7 @@ def run_full_scan():
     print(f"[{ist_str()}] Sector: {current_sector} ({len(sector_stocks)} stocks) | Nifty: {nifty_trend}")
 
     all_signals = []
-    for idx, ticker in enumerate(sector_stocks):
+    for ticker in sector_stocks:
         sigs = scan_stock(ticker, nifty_trend)
         all_signals.extend(sigs)
         time.sleep(0.3)
@@ -532,10 +541,10 @@ def run_full_scan():
     buys  = [s for s in all_signals if s["Signal"] == "BUY"]
     sells = [s for s in all_signals if s["Signal"] == "SELL"]
 
-    # Alert YOUR Telegram + open paper positions
     for s in buys + sells:
+        emoji = "🟢" if s["Signal"] == "BUY" else "🔴"
         send_telegram(
-            f"{'BUY' if s['Signal']=='BUY' else 'SELL'} - {s['Stock']}\n"
+            f"{emoji} <b>{s['Signal']} — {s['Stock']}</b>\n"
             f"Strategy : {s['Strategy']}\n"
             f"Price    : {s['Price']}\n"
             f"SL       : {s['Stop Loss']}\n"
@@ -549,30 +558,32 @@ def run_full_scan():
 
     save_to_log(all_signals)
 
-    # Summary to YOUR chat
     send_telegram(
-        f"Scan Done - {current_sector}\n"
-        f"BUY:{len(buys)} SELL:{len(sells)}\n"
+        f"✅ Scan Done — {current_sector}\n"
+        f"🟢 BUY:{len(buys)} 🔴 SELL:{len(sells)}\n"
         f"Nifty:{nifty_trend} | {'LIVE' if LIVE_TRADING else 'PAPER'}\n"
         f"{ist_str()}"
     )
-    print(f"[{ist_str()}] Done - BUY:{len(buys)} SELL:{len(sells)}")
+    print(f"[{ist_str()}] Done — BUY:{len(buys)} SELL:{len(sells)}")
     print("-" * 60)
 
 # ── Entry point ─────────────────────────────────────────────
 SINGLE_RUN = "--single-run" in sys.argv
 print("=" * 60)
-print("PROJECT 1 - INTRADAY SCANNER")
-print(f"Mode    : {'SINGLE RUN (GitHub Actions)' if SINGLE_RUN else 'CONTINUOUS (local)'}")
+print("PROJECT 1 — INTRADAY SCANNER (GITHUB ACTIONS VERSION)")
+print(f"Mode    : {'SINGLE RUN' if SINGLE_RUN else 'CONTINUOUS LOOP'}")
 print(f"Capital : {'LIVE' if LIVE_TRADING else 'PAPER'} Rs.{CAPITAL:,.0f}")
 print(f"Started : {ist_str()}")
 print("=" * 60)
 
+# Always reset alert file at the top of every run
+reset_alert_file_if_new_day()
+
 if SINGLE_RUN:
     run_full_scan()
-    print(f"[{ist_str()}] Single run complete - exiting.")
+    print(f"[{ist_str()}] Single run complete — exiting.")
 else:
-    send_telegram(f"Scheduler started\nEvery {SCAN_INTERVAL} min during market hours.\n{ist_str()}")
+    send_telegram(f"🚀 Scheduler started\nEvery {SCAN_INTERVAL} min during market hours.\n{ist_str()}")
     run_full_scan()
     schedule.every(SCAN_INTERVAL).minutes.do(run_full_scan)
     while True:
