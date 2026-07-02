@@ -141,37 +141,57 @@ def send_telegram(msg, chat_id=None):
 
 # ── Nifty 50 market filter ─────────────────────────────────
 def get_nifty_trend():
-    """Returns 'UP', 'DOWN', or 'NEUTRAL' based on Nifty 50 direction."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36"
+    })
     try:
-        data = yf.download("^NSEI", period="1d", interval="5m",
-                           auto_adjust=True, progress=False)
+        data = yf.download(
+            "^NSEI", period="1d", interval="5m",
+            auto_adjust=True, progress=False,
+            timeout=30, session=session
+        )
         if data is None or len(data) < 5:
+            print("   Nifty data unavailable - defaulting to NEUTRAL")
             return "NEUTRAL"
-        close = data["Close"].squeeze()
-        # Compare current price to 30-min ago (6 candles of 5 min)
-        lookback = min(6, len(close) - 1)
-        current = float(close.iloc[-1])
-        prev    = float(close.iloc[-lookback])
-        change_pct = (current - prev) / prev * 100
-        if change_pct > 0.3:
-            return "UP"
-        elif change_pct < -0.3:
-            return "DOWN"
+        close      = data["Close"].squeeze()
+        lookback   = min(6, len(close) - 1)
+        change_pct = (float(close.iloc[-1]) - float(close.iloc[-lookback])) \
+                     / float(close.iloc[-lookback]) * 100
+        if change_pct > 0.3:  return "UP"
+        if change_pct < -0.3: return "DOWN"
         return "NEUTRAL"
-    except:
+    except Exception as e:
+        print(f"   Nifty trend error: {e} - defaulting to NEUTRAL")
         return "NEUTRAL"
 
 # ── Fetch 5-min intraday data ──────────────────────────────
-def fetch_intraday(ticker):
-    try:
-        data = yf.download(ticker, period="1d", interval="5m",
-                           auto_adjust=True, progress=False)
-        if data is None or len(data) < 15:
-            return None
-        data.columns = [c[0] if isinstance(c, tuple) else c for c in data.columns]
-        return data
-    except:
-        return None
+def fetch_intraday(ticker, retries=3):
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36"
+    })
+    for attempt in range(retries):
+        try:
+            data = yf.download(
+                ticker, period="1d", interval="5m",
+                auto_adjust=True, progress=False,
+                timeout=30, session=session
+            )
+            if data is not None and len(data) >= 15:
+                data.columns = [c[0] if isinstance(c, tuple) else c
+                                for c in data.columns]
+                return data
+            time.sleep(1)
+        except Exception as e:
+            print(f"   [{ticker}] Attempt {attempt+1}/{retries}: {e}")
+            if attempt < retries - 1:
+                time.sleep(3)
+    return None
 
 def get_ltp(ticker):
     try:
