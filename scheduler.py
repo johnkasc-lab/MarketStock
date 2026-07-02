@@ -1,12 +1,13 @@
 """
 PROJECT 1 — Intraday Scanner (Single User / Your Own Alerts)
-Runs on GitHub Actions every 5 min during market hours.
-Sends signals to YOUR Telegram only.
-Executor handles your own paper/live capital separately.
+Scans NSE stocks every 5 min during market hours via GitHub Actions.
+Sends BUY/SELL signals to YOUR Telegram only.
+Includes: sector rotation (fast runs), Yahoo Finance fix,
+          Nifty trend filter, ORB strategy, paper position tracking.
 
 Usage:
-    python scheduler_project1.py                # continuous (local)
-    python scheduler_project1.py --single-run   # one scan (GitHub Actions)
+    python scheduler.py                 # continuous loop (local laptop)
+    python scheduler.py --single-run    # one scan + exit (GitHub Actions)
 """
 
 import sys
@@ -94,7 +95,8 @@ SECTORS = {
         "HONAUT.NS","INOXWIND.NS","VIJAYA.NS","BOSCHLTD.NS","MPHASIS.NS",
     ],
 }
-ALL_STOCKS = [s for sec in SECTORS.values() for s in sec]
+ALL_STOCKS   = [s for sec in SECTORS.values() for s in sec]
+SECTOR_NAMES = list(SECTORS.keys())
 
 # ── IST helpers ────────────────────────────────────────────
 def ist_now():
@@ -112,69 +114,54 @@ def is_market_open():
     )
 
 def is_good_trading_window():
-    """Avoid first 15 min (volatile) and last 15 min (no time to resolve)."""
+    """Avoid first 15 min and last 15 min of session."""
     n = ist_now()
-    after_open  = not (n.hour == 9 and n.minute < 30)
-    before_close= not (n.hour == 15 and n.minute > 0)
+    after_open   = not (n.hour == 9 and n.minute < 30)
+    before_close = not (n.hour >= 15)
     return after_open and before_close
 
 def is_eod():
     n = ist_now()
-    return n.hour == 15 and n.minute >= 15
+    return n.weekday() < 5 and n.hour == 15 and n.minute >= 15
+
+def get_current_sector():
+    """Rotate sectors every 15 min so each run is fast (<2 min)."""
+    n = ist_now()
+    minutes_since_open = (n.hour - 9) * 60 + n.minute - 15
+    if minutes_since_open < 0:
+        minutes_since_open = 0
+    idx = (minutes_since_open // 15) % len(SECTOR_NAMES)
+    return SECTOR_NAMES[idx]
 
 # ── Telegram ───────────────────────────────────────────────
 def send_telegram(msg, chat_id=None):
     cid = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_TOKEN or not cid:
-        print(f"   [Telegram] Token/ChatID missing — skipping send.")
+        print("   [Telegram] Token/ChatID missing.")
         return
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": cid, "text": msg, "parse_mode": "HTML"},
+            data={"chat_id": str(cid), "text": msg, "parse_mode": "HTML"},
             timeout=10
         )
         if r.status_code != 200:
-            print(f"   [Telegram] HTTP {r.status_code}: {r.text[:100]}")
+            print(f"   [Telegram] HTTP {r.status_code}: {r.text[:80]}")
     except Exception as e:
         print(f"   [Telegram] Error: {e}")
 
-# ── Nifty 50 market filter ─────────────────────────────────
-def get_nifty_trend():
-    session = requests.Session()
-    session.headers.update({
+# ── Yahoo Finance with User-Agent fix + retries ────────────
+def _yf_session():
+    s = requests.Session()
+    s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36"
     })
-    try:
-        data = yf.download(
-            "^NSEI", period="1d", interval="5m",
-            auto_adjust=True, progress=False,
-            timeout=30, session=session
-        )
-        if data is None or len(data) < 5:
-            print("   Nifty data unavailable - defaulting to NEUTRAL")
-            return "NEUTRAL"
-        close      = data["Close"].squeeze()
-        lookback   = min(6, len(close) - 1)
-        change_pct = (float(close.iloc[-1]) - float(close.iloc[-lookback])) \
-                     / float(close.iloc[-lookback]) * 100
-        if change_pct > 0.3:  return "UP"
-        if change_pct < -0.3: return "DOWN"
-        return "NEUTRAL"
-    except Exception as e:
-        print(f"   Nifty trend error: {e} - defaulting to NEUTRAL")
-        return "NEUTRAL"
+    return s
 
-# ── Fetch 5-min intraday data ──────────────────────────────
 def fetch_intraday(ticker, retries=3):
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36"
-    })
+    session = _yf_session()
     for attempt in range(retries):
         try:
             data = yf.download(
@@ -195,7 +182,8 @@ def fetch_intraday(ticker, retries=3):
 
 def get_ltp(ticker):
     try:
-        t = yf.Ticker(ticker)
+        session = _yf_session()
+        t = yf.Ticker(ticker, session=session)
         price = t.fast_info.get("last_price")
         return float(price) if price else None
     except:
@@ -206,31 +194,45 @@ def calc_vwap(data):
     vol = data["Volume"].squeeze()
     return (tp * vol).cumsum() / vol.cumsum()
 
+# ── Nifty trend filter ─────────────────────────────────────
+def get_nifty_trend():
+    session = _yf_session()
+    try:
+        data = yf.download("^NSEI", period="1d", interval="5m",
+                           auto_adjust=True, progress=False,
+                           timeout=30, session=session)
+        if data is None or len(data) < 5:
+            return "NEUTRAL"
+        close      = data["Close"].squeeze()
+        lookback   = min(6, len(close) - 1)
+        change_pct = (float(close.iloc[-1]) - float(close.iloc[-lookback])) \
+                     / float(close.iloc[-lookback]) * 100
+        if change_pct > 0.3:  return "UP"
+        if change_pct < -0.3: return "DOWN"
+        return "NEUTRAL"
+    except Exception as e:
+        print(f"   Nifty error: {e} - defaulting NEUTRAL")
+        return "NEUTRAL"
+
 # ── Strategy 1: SCALP ──────────────────────────────────────
 def scalp_signal(data):
     close  = data["Close"].squeeze()
     volume = data["Volume"].squeeze()
     vwap   = calc_vwap(data)
-    delta    = close.diff()
-    gain     = delta.clip(lower=0).ewm(span=14).mean()
-    loss     = (-delta.clip(upper=0)).ewm(span=14).mean()
-    rsi      = 100 - 100 / (1 + gain / loss)
+    delta  = close.diff()
+    gain   = delta.clip(lower=0).ewm(span=14).mean()
+    loss   = (-delta.clip(upper=0)).ewm(span=14).mean()
+    rsi    = 100 - 100 / (1 + gain / loss)
     price    = float(close.iloc[-1])
     vwap_val = float(vwap.iloc[-1])
     rsi_val  = float(rsi.iloc[-1])
     vol_avg  = float(volume.rolling(20).mean().iloc[-1])
     vol_now  = float(volume.iloc[-1])
-    above_vwap = price > vwap_val
-    below_vwap = price < vwap_val
-    vol_spike  = vol_now > vol_avg * 1.3
-    if above_vwap and vol_spike and 40 < rsi_val < 65:
-        sl     = round(vwap_val * 0.997, 2)
-        target = round(price * 1.005, 2)
-        return "BUY", price, sl, target, rsi_val, "SCALP"
-    if below_vwap and vol_spike and 55 < rsi_val < 75:
-        sl     = round(price * 1.003, 2)
-        target = round(price * 0.995, 2)
-        return "SELL", price, sl, target, rsi_val, "SCALP"
+    vol_spike = vol_now > vol_avg * 1.3
+    if price > vwap_val and vol_spike and 40 < rsi_val < 65:
+        return "BUY",  price, round(vwap_val*0.997,2), round(price*1.005,2), rsi_val, "SCALP"
+    if price < vwap_val and vol_spike and 55 < rsi_val < 75:
+        return "SELL", price, round(price*1.003,2), round(price*0.995,2), rsi_val, "SCALP"
     return "HOLD", price, 0, 0, rsi_val, "SCALP"
 
 # ── Strategy 2: MOMENTUM ───────────────────────────────────
@@ -244,22 +246,14 @@ def momentum_signal(data):
     loss   = (-delta.clip(upper=0)).ewm(span=14).mean()
     rsi    = 100 - 100 / (1 + gain / loss)
     price    = float(close.iloc[-1])
-    e9_now   = float(ema9.iloc[-1]);  e9_prev  = float(ema9.iloc[-2])
-    e21_now  = float(ema21.iloc[-1]); e21_prev = float(ema21.iloc[-2])
+    e9n, e9p = float(ema9.iloc[-1]),  float(ema9.iloc[-2])
+    e21n,e21p= float(ema21.iloc[-1]), float(ema21.iloc[-2])
     rsi_val  = float(rsi.iloc[-1])
-    vol_avg  = float(volume.rolling(20).mean().iloc[-1])
-    vol_now  = float(volume.iloc[-1])
-    cross_up   = e9_now > e21_now and e9_prev <= e21_prev
-    cross_down = e9_now < e21_now and e9_prev >= e21_prev
-    vol_ok     = vol_now > vol_avg * 1.2
-    if cross_up and vol_ok and rsi_val < 65:
-        sl     = round(float(ema21.iloc[-1]) * 0.993, 2)
-        target = round(price * 1.015, 2)
-        return "BUY", price, sl, target, rsi_val, "MOMENTUM"
-    if cross_down and rsi_val > 40:
-        sl     = round(float(ema21.iloc[-1]) * 1.007, 2)
-        target = round(price * 0.985, 2)
-        return "SELL", price, sl, target, rsi_val, "MOMENTUM"
+    vol_ok   = float(volume.iloc[-1]) > float(volume.rolling(20).mean().iloc[-1]) * 1.2
+    if e9n > e21n and e9p <= e21p and vol_ok and rsi_val < 65:
+        return "BUY",  price, round(e21n*0.993,2), round(price*1.015,2), rsi_val, "MOMENTUM"
+    if e9n < e21n and e9p >= e21p and rsi_val > 40:
+        return "SELL", price, round(e21n*1.007,2), round(price*0.985,2), rsi_val, "MOMENTUM"
     return "HOLD", price, 0, 0, rsi_val, "MOMENTUM"
 
 # ── Strategy 3: SWING ──────────────────────────────────────
@@ -268,80 +262,47 @@ def swing_signal(data):
     ema12  = close.ewm(span=12, adjust=False).mean()
     ema26  = close.ewm(span=26, adjust=False).mean()
     macd   = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
+    sig    = macd.ewm(span=9, adjust=False).mean()
     sma20  = close.rolling(20).mean()
     std20  = close.rolling(20).std()
-    bb_up  = sma20 + 2 * std20
-    bb_low = sma20 - 2 * std20
-    price    = float(close.iloc[-1])
-    macd_now = float(macd.iloc[-1]); macd_prev = float(macd.iloc[-2])
-    sig_now  = float(signal.iloc[-1]); sig_prev = float(signal.iloc[-2])
-    bb_low_v = float(bb_low.iloc[-1])
-    bb_up_v  = float(bb_up.iloc[-1])
-    sma_v    = float(sma20.iloc[-1])
-    cross_up   = macd_now > sig_now and macd_prev <= sig_prev
-    cross_down = macd_now < sig_now and macd_prev >= sig_prev
-    near_low   = price < sma_v and price > bb_low_v
-    near_high  = price > sma_v and price < bb_up_v
-    if cross_up and near_low:
-        sl     = round(bb_low_v * 0.99, 2)
-        target = round(sma_v * 1.025, 2)
-        return "BUY", price, sl, target, 0, "SWING"
-    if cross_down and near_high:
-        sl     = round(bb_up_v * 1.01, 2)
-        target = round(sma_v * 0.975, 2)
-        return "SELL", price, sl, target, 0, "SWING"
+    bb_up  = sma20 + 2*std20
+    bb_low = sma20 - 2*std20
+    price  = float(close.iloc[-1])
+    mn,mp  = float(macd.iloc[-1]), float(macd.iloc[-2])
+    sn,sp  = float(sig.iloc[-1]),  float(sig.iloc[-2])
+    bbl    = float(bb_low.iloc[-1])
+    bbu    = float(bb_up.iloc[-1])
+    sma    = float(sma20.iloc[-1])
+    if mn > sn and mp <= sp and price < sma and price > bbl:
+        return "BUY",  price, round(bbl*0.99,2), round(sma*1.025,2), 0, "SWING"
+    if mn < sn and mp >= sp and price > sma and price < bbu:
+        return "SELL", price, round(bbu*1.01,2), round(sma*0.975,2), 0, "SWING"
     return "HOLD", price, 0, 0, 0, "SWING"
 
-# ── NEW: Strategy 4 — Opening Range Breakout (ORB) ─────────
+# ── Strategy 4: ORB (Opening Range Breakout) ───────────────
 def orb_signal(data):
-    """
-    Opening Range Breakout — most powerful NSE intraday strategy.
-    First 15 min (9:15-9:30) defines the range. Breakout = signal.
-    Only fires once in the first 90 min of the session.
-    """
     try:
         close  = data["Close"].squeeze()
         high   = data["High"].squeeze()
         low    = data["Low"].squeeze()
         volume = data["Volume"].squeeze()
-
-        # Need at least 6 candles (30 min) to establish ORB
         if len(data) < 6:
             return "HOLD", float(close.iloc[-1]), 0, 0, 0, "ORB"
-
-        # First 3 candles = 9:15-9:30 AM (opening range)
-        orb_high = float(high.iloc[:3].max())
-        orb_low  = float(low.iloc[:3].min())
-        orb_range= orb_high - orb_low
-
-        # Current values
-        price   = float(close.iloc[-1])
-        vol_avg = float(volume.rolling(20).mean().iloc[-1])
-        vol_now = float(volume.iloc[-1])
-        vol_ok  = vol_now > vol_avg * 1.5  # stronger volume required for ORB
-
-        # Only trade ORB in first 90 min (9:30-11:00 AM)
+        orb_high  = float(high.iloc[:3].max())
+        orb_low   = float(low.iloc[:3].min())
+        orb_range = orb_high - orb_low
+        price     = float(close.iloc[-1])
+        vol_ok    = float(volume.iloc[-1]) > float(volume.rolling(20).mean().iloc[-1]) * 1.5
         n = ist_now()
-        in_orb_window = (n.hour == 9 and n.minute >= 30) or \
-                        (n.hour == 10) or \
-                        (n.hour == 11 and n.minute == 0)
-
-        if not in_orb_window:
+        in_window = (n.hour == 9 and n.minute >= 30) or \
+                    (n.hour == 10) or \
+                    (n.hour == 11 and n.minute == 0)
+        if not in_window:
             return "HOLD", price, 0, 0, 0, "ORB"
-
-        # Breakout above range high
         if price > orb_high and vol_ok:
-            sl     = round(orb_high - orb_range * 0.5, 2)
-            target = round(price + orb_range * 1.5, 2)
-            return "BUY", price, sl, target, 0, "ORB"
-
-        # Breakdown below range low
+            return "BUY",  price, round(orb_high - orb_range*0.5,2), round(price + orb_range*1.5,2), 0, "ORB"
         if price < orb_low and vol_ok:
-            sl     = round(orb_low + orb_range * 0.5, 2)
-            target = round(price - orb_range * 1.5, 2)
-            return "SELL", price, sl, target, 0, "ORB"
-
+            return "SELL", price, round(orb_low  + orb_range*0.5,2), round(price - orb_range*1.5,2), 0, "ORB"
         return "HOLD", price, 0, 0, 0, "ORB"
     except:
         return "HOLD", 0, 0, 0, 0, "ORB"
@@ -369,8 +330,8 @@ def mark_alerted(ticker, strategy):
 def load_open_positions():
     if not os.path.exists(OPEN_POS_FILE):
         return pd.DataFrame(columns=[
-            "Date","Ticker","Strategy","Side","EntryPrice","Qty",
-            "SL","Target","OrderId","EntryTime","Status"])
+            "Date","Ticker","Strategy","Side","EntryPrice",
+            "Qty","SL","Target","OrderId","EntryTime","Status"])
     return pd.read_csv(OPEN_POS_FILE)
 
 def save_open_positions(df):
@@ -387,135 +348,82 @@ def save_ledger(df):
     df.to_csv(LEDGER_FILE, index=False)
 
 def open_paper_position(signal):
-    """Open a new paper position from a signal dict."""
-    pos_df  = load_open_positions()
-    ticker  = signal["Stock"] + ".NS"
-
-    # Skip if already have open position in this stock+strategy
+    pos_df = load_open_positions()
+    ticker = signal["Stock"] + ".NS"
     existing = pos_df[(pos_df["Ticker"] == ticker) &
                       (pos_df["Strategy"] == signal["Strategy"]) &
                       (pos_df["Status"] == "OPEN")]
     if len(existing) > 0:
         return
-
-    # Count open positions — cap at 5 simultaneous
-    open_count = len(pos_df[pos_df["Status"] == "OPEN"])
-    if open_count >= 5:
+    if len(pos_df[pos_df["Status"] == "OPEN"]) >= 5:
         return
-
-    price   = float(str(signal["Price"]).replace("Rs.", "").replace("₹", ""))
-    sl      = float(str(signal["Stop Loss"]).replace("Rs.", "").replace("₹", "").replace("-", "0") or 0)
-    target  = float(str(signal["Target"]).replace("Rs.", "").replace("₹", "").replace("-", "0") or 0)
-    risk    = abs(price - sl) if sl else price * 0.01
-    qty     = max(1, int((CAPITAL * RISK_PCT) / risk)) if risk > 0 else 1
-    side    = signal["Signal"]
-    order_id= f"PAPER-{int(time.time() * 1000) % 10000000000}"
-    today   = ist_now().strftime("%Y-%m-%d")
-
+    price  = float(str(signal["Price"]).replace("Rs.","").replace("₹",""))
+    sl     = float(str(signal["Stop Loss"]).replace("Rs.","").replace("₹","").replace("-","0") or 0)
+    target = float(str(signal["Target"]).replace("Rs.","").replace("₹","").replace("-","0") or 0)
+    risk   = abs(price - sl) if sl else price * 0.01
+    qty    = max(1, int((CAPITAL * RISK_PCT) / risk)) if risk > 0 else 1
     new_row = pd.DataFrame([{
-        "Date"      : today,
+        "Date"      : ist_now().strftime("%Y-%m-%d"),
         "Ticker"    : ticker,
         "Strategy"  : signal["Strategy"],
-        "Side"      : side,
+        "Side"      : signal["Signal"],
         "EntryPrice": price,
         "Qty"       : qty,
         "SL"        : sl,
         "Target"    : target,
-        "OrderId"   : order_id,
+        "OrderId"   : f"PAPER-{int(time.time()*1000) % 10000000000}",
         "EntryTime" : ist_str(),
         "Status"    : "OPEN",
     }])
-    updated = pd.concat([pos_df, new_row], ignore_index=True)
-    save_open_positions(updated)
-    print(f"   [PAPER] OPEN {side} {ticker} @ {price} qty={qty} SL={sl} T={target}")
+    save_open_positions(pd.concat([pos_df, new_row], ignore_index=True))
+    print(f"   [PAPER] OPEN {signal['Signal']} {ticker} @ {price} qty={qty}")
 
 def monitor_and_close_positions():
-    """Check all open positions against current price. Close if SL/Target hit."""
-    pos_df  = load_open_positions()
-    ledger  = load_ledger()
-    open_p  = pos_df[pos_df["Status"] == "OPEN"].copy()
-
+    pos_df = load_open_positions()
+    ledger = load_ledger()
+    open_p = pos_df[pos_df["Status"] == "OPEN"].copy()
     if open_p.empty:
         return
-
-    updated_rows = []
     new_ledger_rows = []
-
     for idx, pos in open_p.iterrows():
         ltp = get_ltp(pos["Ticker"])
         if ltp is None:
-            updated_rows.append(pos)
             continue
-
         entry  = float(pos["EntryPrice"])
-        sl     = float(pos["SL"]) if pos["SL"] else 0
+        sl     = float(pos["SL"])     if pos["SL"]     else 0
         target = float(pos["Target"]) if pos["Target"] else 0
         side   = pos["Side"]
         qty    = int(pos["Qty"])
         exit_reason = None
-
-        # Check SL hit
         if sl > 0:
             if side == "BUY"  and ltp <= sl: exit_reason = "SL_HIT"
             if side == "SELL" and ltp >= sl: exit_reason = "SL_HIT"
-
-        # Check Target hit
         if target > 0 and not exit_reason:
             if side == "BUY"  and ltp >= target: exit_reason = "TARGET_HIT"
             if side == "SELL" and ltp <= target: exit_reason = "TARGET_HIT"
-
         if exit_reason:
-            if side == "BUY":
-                pnl = round((ltp - entry) * qty, 2)
-            else:
-                pnl = round((entry - ltp) * qty, 2)
-
-            pos["Status"] = "CLOSED"
-            updated_rows.append(pos)
+            pnl = round((ltp - entry)*qty, 2) if side == "BUY" else round((entry - ltp)*qty, 2)
+            pos_df.at[idx, "Status"] = "CLOSED"
             new_ledger_rows.append({
-                "Date"       : pos["Date"],
-                "Ticker"     : pos["Ticker"],
-                "Strategy"   : pos["Strategy"],
-                "Side"       : side,
-                "EntryPrice" : entry,
-                "ExitPrice"  : ltp,
-                "Qty"        : qty,
-                "PnL"        : pnl,
-                "ExitReason" : exit_reason,
-                "EntryTime"  : pos["EntryTime"],
-                "ExitTime"   : ist_str(),
-                "Mode"       : "LIVE" if LIVE_TRADING else "PAPER",
+                "Date"      : pos["Date"],       "Ticker"    : pos["Ticker"],
+                "Strategy"  : pos["Strategy"],   "Side"      : side,
+                "EntryPrice": entry,              "ExitPrice" : ltp,
+                "Qty"       : qty,                "PnL"       : pnl,
+                "ExitReason": exit_reason,        "EntryTime" : pos["EntryTime"],
+                "ExitTime"  : ist_str(),          "Mode"      : "LIVE" if LIVE_TRADING else "PAPER",
             })
-            emoji = "TARGET" if exit_reason == "TARGET_HIT" else "SL"
-            print(f"   [PAPER] CLOSE {pos['Ticker']} {exit_reason} LTP={ltp} PnL={pnl}")
+            emoji = "✅" if exit_reason == "TARGET_HIT" else "🛑"
             send_telegram(
-                f"{'✅' if exit_reason == 'TARGET_HIT' else '🛑'} "
-                f"<b>{exit_reason} — {pos['Ticker'].replace('.NS','')}</b>\n"
-                f"Side    : {side}\n"
-                f"Entry   : Rs.{entry}\n"
-                f"Exit    : Rs.{ltp}\n"
-                f"P&L     : Rs.{pnl}\n"
-                f"Time    : {ist_str()}"
+                f"{emoji} <b>{exit_reason} — {pos['Ticker'].replace('.NS','')}</b>\n"
+                f"Side  : {side}\nEntry : Rs.{entry}\nExit  : Rs.{ltp}\nP&L   : Rs.{pnl}\n"
+                f"Time  : {ist_str()}"
             )
-        else:
-            updated_rows.append(pos)
-
-    # Update positions file
-    closed_mask = pos_df["Status"] != "OPEN"
-    closed_rows = pos_df[closed_mask]
-    updated_df  = pd.concat(
-        [closed_rows, pd.DataFrame(updated_rows)], ignore_index=True
-    ).drop_duplicates(subset=["OrderId"], keep="last")
-    save_open_positions(updated_df)
-
-    # Update ledger
+            print(f"   [PAPER] CLOSE {pos['Ticker']} {exit_reason} ltp={ltp} pnl={pnl}")
+    save_open_positions(pos_df)
     if new_ledger_rows:
-        updated_ledger = pd.concat(
-            [ledger, pd.DataFrame(new_ledger_rows)], ignore_index=True)
-        save_ledger(updated_ledger)
+        save_ledger(pd.concat([ledger, pd.DataFrame(new_ledger_rows)], ignore_index=True))
 
 def eod_square_off():
-    """Force-close all open positions at EOD."""
     if not is_eod():
         return
     pos_df = load_open_positions()
@@ -523,77 +431,59 @@ def eod_square_off():
     open_p = pos_df[pos_df["Status"] == "OPEN"].copy()
     if open_p.empty:
         return
-
     new_ledger_rows = []
     for idx, pos in open_p.iterrows():
-        ltp = get_ltp(pos["Ticker"]) or float(pos["EntryPrice"])
+        ltp   = get_ltp(pos["Ticker"]) or float(pos["EntryPrice"])
         entry = float(pos["EntryPrice"])
         qty   = int(pos["Qty"])
         side  = pos["Side"]
-        pnl   = round((ltp - entry) * qty, 2) if side == "BUY" else round((entry - ltp) * qty, 2)
+        pnl   = round((ltp-entry)*qty,2) if side=="BUY" else round((entry-ltp)*qty,2)
         pos_df.at[idx, "Status"] = "CLOSED"
         new_ledger_rows.append({
-            "Date"      : pos["Date"],
-            "Ticker"    : pos["Ticker"],
-            "Strategy"  : pos["Strategy"],
-            "Side"      : side,
-            "EntryPrice": entry,
-            "ExitPrice" : ltp,
-            "Qty"       : qty,
-            "PnL"       : pnl,
-            "ExitReason": "EOD_SQUARE_OFF",
-            "EntryTime" : pos["EntryTime"],
-            "ExitTime"  : ist_str(),
-            "Mode"      : "LIVE" if LIVE_TRADING else "PAPER",
+            "Date"      : pos["Date"],       "Ticker"    : pos["Ticker"],
+            "Strategy"  : pos["Strategy"],   "Side"      : side,
+            "EntryPrice": entry,             "ExitPrice" : ltp,
+            "Qty"       : qty,               "PnL"       : pnl,
+            "ExitReason": "EOD_SQUARE_OFF",  "EntryTime" : pos["EntryTime"],
+            "ExitTime"  : ist_str(),         "Mode"      : "LIVE" if LIVE_TRADING else "PAPER",
         })
-        print(f"   [EOD] Square-off {pos['Ticker']} PnL={pnl}")
-
+        print(f"   [EOD] {pos['Ticker']} pnl={pnl}")
     save_open_positions(pos_df)
     if new_ledger_rows:
-        updated_ledger = pd.concat([ledger, pd.DataFrame(new_ledger_rows)], ignore_index=True)
-        save_ledger(updated_ledger)
-
-    # Send EOD summary
+        save_ledger(pd.concat([ledger, pd.DataFrame(new_ledger_rows)], ignore_index=True))
     total_pnl = sum(r["PnL"] for r in new_ledger_rows)
     send_telegram(
         f"📊 <b>EOD Summary</b>\n"
         f"Positions closed : {len(new_ledger_rows)}\n"
-        f"Total P&amp;L     : Rs.{round(total_pnl, 2)}\n"
+        f"Total P&amp;L    : Rs.{round(total_pnl,2)}\n"
         f"Mode             : {'LIVE' if LIVE_TRADING else 'PAPER'}\n"
         f"Time             : {ist_str()}"
     )
 
-# ── Scan one stock ─────────────────────────────────────────
+# ── Scan one stock (all 4 strategies) ─────────────────────
 def scan_stock(ticker, nifty_trend="NEUTRAL"):
     data = fetch_intraday(ticker)
     if data is None:
         return []
-
     signals = []
     for strategy_fn in [scalp_signal, momentum_signal, swing_signal, orb_signal]:
         try:
             sig, price, sl, target, rsi, strat = strategy_fn(data)
-
-            # Nifty 50 filter — suppress signals that fight the market
-            if nifty_trend == "DOWN" and sig == "BUY":
-                continue
-            if nifty_trend == "UP" and sig == "SELL":
-                continue
-
+            if nifty_trend == "DOWN" and sig == "BUY":  continue
+            if nifty_trend == "UP"   and sig == "SELL": continue
             if sig in ["BUY", "SELL"] and not already_alerted_today(ticker, strat):
                 mark_alerted(ticker, strat)
-                rr = round(abs(target - price) / abs(price - sl), 2) \
-                     if sl and target and price != sl else 0
+                rr = round(abs(target-price)/abs(price-sl),2) if sl and target and price!=sl else 0
                 signals.append({
                     "Time"     : ist_str(),
-                    "Stock"    : ticker.replace(".NS", ""),
+                    "Stock"    : ticker.replace(".NS",""),
                     "Strategy" : strat,
                     "Signal"   : sig,
                     "Price"    : f"Rs.{price}",
                     "Stop Loss": f"Rs.{sl}" if sl else "-",
                     "Target"   : f"Rs.{target}" if target else "-",
                     "R:R"      : f"1:{rr}" if rr else "-",
-                    "RSI"      : round(rsi, 1) if rsi else "-",
+                    "RSI"      : round(rsi,1) if rsi else "-",
                 })
         except:
             pass
@@ -609,74 +499,71 @@ def save_to_log(signals):
 # ── Main scan ──────────────────────────────────────────────
 def run_full_scan():
     if not is_market_open():
-        print(f"[{ist_str()}] Market closed - skipping scan.")
+        print(f"[{ist_str()}] Market closed - skipping.")
         return
 
-    # EOD check first
+    # EOD square-off
     if is_eod():
-        print(f"[{ist_str()}] EOD — squaring off open positions.")
+        print(f"[{ist_str()}] EOD - squaring off positions.")
         eod_square_off()
         return
 
-    # Skip bad trading windows
+    # Monitor open positions first
+    monitor_and_close_positions()
+
+    # Skip signal scanning outside good window (first/last 15 min)
     if not is_good_trading_window():
-        print(f"[{ist_str()}] Outside good trading window (first/last 15 min) - monitoring only.")
-        monitor_and_close_positions()
+        print(f"[{ist_str()}] Outside signal window - monitoring only.")
         return
 
-    # Check Nifty trend for market-wide filter
-    nifty_trend = get_nifty_trend()
-    print(f"[{ist_str()}] Nifty trend: {nifty_trend} | Scanning {len(ALL_STOCKS)} stocks...")
+    # Sector rotation — scan one sector per run
+    current_sector = get_current_sector()
+    sector_stocks  = SECTORS[current_sector]
+    nifty_trend    = get_nifty_trend()
+
+    print(f"[{ist_str()}] Sector: {current_sector} ({len(sector_stocks)} stocks) | Nifty: {nifty_trend}")
 
     all_signals = []
-    for idx, ticker in enumerate(ALL_STOCKS):
+    for idx, ticker in enumerate(sector_stocks):
         sigs = scan_stock(ticker, nifty_trend)
         all_signals.extend(sigs)
         time.sleep(0.3)
-        if (idx + 1) % 50 == 0:
-            print(f"   ...scanned {idx + 1}/{len(ALL_STOCKS)}")
 
     buys  = [s for s in all_signals if s["Signal"] == "BUY"]
     sells = [s for s in all_signals if s["Signal"] == "SELL"]
 
-    # Alert YOUR Telegram
+    # Alert YOUR Telegram + open paper positions
     for s in buys + sells:
-        emoji = "BUY" if s["Signal"] == "BUY" else "SELL"
         send_telegram(
             f"{'BUY' if s['Signal']=='BUY' else 'SELL'} - {s['Stock']}\n"
-            f"Strategy   : {s['Strategy']}\n"
-            f"Price      : {s['Price']}\n"
-            f"Stop Loss  : {s['Stop Loss']}\n"
-            f"Target     : {s['Target']}\n"
-            f"R:R        : {s['R:R']}\n"
-            f"RSI        : {s['RSI']}\n"
-            f"Nifty      : {nifty_trend}\n"
-            f"Time       : {s['Time']}"
+            f"Strategy : {s['Strategy']}\n"
+            f"Price    : {s['Price']}\n"
+            f"SL       : {s['Stop Loss']}\n"
+            f"Target   : {s['Target']}\n"
+            f"R:R      : {s['R:R']}\n"
+            f"RSI      : {s['RSI']}\n"
+            f"Nifty    : {nifty_trend}\n"
+            f"Time     : {s['Time']}"
         )
-        # Open paper position
         open_paper_position(s)
 
     save_to_log(all_signals)
 
-    # Monitor existing open positions for SL/Target hits
-    monitor_and_close_positions()
-
-    # Founder summary
+    # Summary to YOUR chat
     send_telegram(
-        f"Scan Done\n"
-        f"BUY  : {len(buys)} | SELL: {len(sells)}\n"
-        f"Nifty: {nifty_trend}\n"
-        f"Mode : {'LIVE' if LIVE_TRADING else 'PAPER'}\n"
+        f"Scan Done - {current_sector}\n"
+        f"BUY:{len(buys)} SELL:{len(sells)}\n"
+        f"Nifty:{nifty_trend} | {'LIVE' if LIVE_TRADING else 'PAPER'}\n"
         f"{ist_str()}"
     )
-    print(f"[{ist_str()}] Done - BUY:{len(buys)} SELL:{len(sells)} Nifty:{nifty_trend}")
+    print(f"[{ist_str()}] Done - BUY:{len(buys)} SELL:{len(sells)}")
     print("-" * 60)
 
 # ── Entry point ─────────────────────────────────────────────
 SINGLE_RUN = "--single-run" in sys.argv
 print("=" * 60)
-print("PROJECT 1 - INTRADAY SCANNER (Single User)")
-print(f"Mode    : {'SINGLE RUN' if SINGLE_RUN else 'CONTINUOUS'}")
+print("PROJECT 1 - INTRADAY SCANNER")
+print(f"Mode    : {'SINGLE RUN (GitHub Actions)' if SINGLE_RUN else 'CONTINUOUS (local)'}")
 print(f"Capital : {'LIVE' if LIVE_TRADING else 'PAPER'} Rs.{CAPITAL:,.0f}")
 print(f"Started : {ist_str()}")
 print("=" * 60)
@@ -685,7 +572,7 @@ if SINGLE_RUN:
     run_full_scan()
     print(f"[{ist_str()}] Single run complete - exiting.")
 else:
-    send_telegram(f"PROJECT 1 Scheduler started\nEvery {SCAN_INTERVAL} min during market hours.\n{ist_str()}")
+    send_telegram(f"Scheduler started\nEvery {SCAN_INTERVAL} min during market hours.\n{ist_str()}")
     run_full_scan()
     schedule.every(SCAN_INTERVAL).minutes.do(run_full_scan)
     while True:
